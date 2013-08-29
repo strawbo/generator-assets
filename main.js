@@ -60,6 +60,7 @@
         _fallbackBaseDirectory = null,
         _contextPerDocument = {},
         _changeContextPerLayer = {},
+        _changeContextPerDocument = {},
         _photoshopPath = null,
         _currentDocumentId,
         _documentIdsWithMenuClicks = {},
@@ -85,9 +86,12 @@
     }
 
     function deleteDirectoryRecursively(directory) {
+        console.log("Recursively deleting directory %j", directory);
+        
         try {
             // Directory doesn't exist? We're done.
             if (!fs.existsSync(directory)) {
+                console.log("Not deleting directory %j recursively: it doesn't exist", directory);
                 return true;
             }
 
@@ -95,6 +99,7 @@
             var files = fs.readdirSync(directory);
             files.forEach(function (file) {
                 var path = resolve(directory, file);
+                console.log("Deleting file %j", path);
                 if (fs.statSync(path).isDirectory()) {
                     deleteDirectoryRecursively(path);
                 } else {
@@ -103,6 +108,7 @@
             });
 
             // Delete the now empty directory
+            console.log("Deleting directory %j", directory);
             fs.rmdirSync(directory);
 
             return true;
@@ -370,26 +376,108 @@
         }
     }
 
+    // function hasSameStructure(objectA, objectB) {
+    //     var keysA = Object.keys(objectA),
+    //         keysB = Object.keys(objectB);
+
+    //     if (keysA.length !== keysB.length) { return false; }
+    //     for (var i = 0; i < keysA.length; i++) {
+    //         if (keysA[i] !== keysB[i]) {
+    //             return false;
+    //         }
+    //         var valueA = objectA[keysA[i]],
+    //             valueB = objectB[keysB[i]],
+    //             typeA  = Object.prototype.toString.call(valueA),
+    //             typeB  = Object.prototype.toString.call(valueB);
+
+    //         if (typeA !== typeB) {
+    //             console.log("Different types", typeA, typeB);
+    //         }
+            
+    //         if (typeA === typeB && typeB === "Object" && !hasSameStructure(valueA, valueB)) {
+    //             console.log()
+    //             return false;
+    //         }
+    //     }
+
+    // }
+
+    function isSameKindOfChange(/*changeA, changeB*/) {
+        return false;
+        // if (changeA.id !== changeB.id) { return false; }
+
+
+    }
+
     function handleImageChanged(document) {
-        console.log("Image " + document.id + " was changed:", stringify(document));
+        console.log("Document " + document.id + " was changed, enqueuing");
+        
+        var changeContext = _changeContextPerDocument[document.id];
+
+        // If there is a change context, processNextDocumentChange is busy and will pick up this change later
+        if (changeContext) {
+            var priorChange = changeContext.queue[changeContext.queue.length - 1];
+            if (isSameKindOfChange(priorChange, document)) {
+                // Remove the priorChange and replace it with this one
+                changeContext.queue.pop();
+            }
+            changeContext.queue.push(document);
+            return;
+        }
+
+        // No change context? Run processNextDocumentChange.
+        changeContext = _changeContextPerDocument[document.id] = {
+            queue: [document]
+        };
+        processNextDocumentChange(document.id);
+    }
+    
+    function processNextDocumentChange(documentId) {
+        var document = _changeContextPerDocument[documentId].queue.shift();
+
+        if (!document) {
+            var context = _contextPerDocument[documentId];
+            if (context && context.assetGenerationDir) {
+                // Delete directory foo-assets/ for foo.psd if it is empty now
+                deleteDirectoryIfEmpty(context.assetGenerationDir);
+            }
+            console.log("No outstanding document changes to process for document", documentId);
+            delete _changeContextPerDocument[documentId];
+        } else {
+            processDocumentChange(document).fin(function () {
+                processNextDocumentChange(documentId);
+            });
+        }
+    }
+
+    function processDocumentChange(document) {
+        var documentChangeDeferred = Q.defer();
+        
+        console.log("Processing change to document " + document.id + ":", stringify(document));
 
         // If the document was closed
         if (document.closed) {
-            delete _contextPerDocument[document.id];
-            // When two or more files are open, closing the current file first
-            // results in an imageChanged event for the file that is going to
-            // get focused (document.active === true), and is then followed by an
-            // imageChanged event for the closed file (document.closed === true).
-            // Therefore, if a document has been closed, _currentDocumentId
-            // will have changed before the imageChanged event arrives that
-            // informs us about the closed file. Consequently, if the ID is the
-            // same, closed file must have been the last open one
-            // => set _currentDocumentId to null
-            if (document.id === _currentDocumentId) {
-                setCurrentDocumentId(null);
+            try {
+                delete _contextPerDocument[document.id];
+                // When two or more files are open, closing the current file first
+                // results in an imageChanged event for the file that is going to
+                // get focused (document.active === true), and is then followed by an
+                // imageChanged event for the closed file (document.closed === true).
+                // Therefore, if a document has been closed, _currentDocumentId
+                // will have changed before the imageChanged event arrives that
+                // informs us about the closed file. Consequently, if the ID is the
+                // same, closed file must have been the last open one
+                // => set _currentDocumentId to null
+                if (document.id === _currentDocumentId) {
+                    setCurrentDocumentId(null);
+                }
+            } catch (e) {
+                console.error("Error when handling a document.closed event", e.stack);
+            } finally {
+                documentChangeDeferred.resolve();
             }
             // Stop here
-            return;
+            return documentChangeDeferred.promise;
         }
 
         function traverseLayers(obj, callback, isLayer) {
@@ -405,71 +493,82 @@
             unknownChange = false,
             layersMoved = false;
         
-        traverseLayers(document, function (obj, isLayer) {
-            if (unknownChange) { return; }
-            if (obj.changed) {
-                unknownChange = true;
-                if (isLayer) {
-                    console.warn("Photoshop reported an unknown change in layer %j: %j", obj.id, obj);
-                } else {
-                    console.warn("Photoshop reported an unknown change in the document");
-                }
-            }
-            else if (isLayer) {
-                var layerContext = documentContext.layers && documentContext.layers[obj.id],
-                    layerType    = obj.type || (layerContext && layerContext.type);
-                
-                if (layerType === "adjustmentLayer") {
-                    console.warn("An adjustment layer changed, treating this as an unknown change: %j", obj);
+        try {
+            traverseLayers(document, function (obj, isLayer) {
+                if (unknownChange) { return; }
+                if (obj.changed) {
                     unknownChange = true;
+                    if (isLayer) {
+                        console.warn("Photoshop reported an unknown change in layer %j: %j", obj.id, obj);
+                    } else {
+                        console.warn("Photoshop reported an unknown change in the document");
+                    }
                 }
+                else if (isLayer) {
+                    var layerContext = documentContext.layers && documentContext.layers[obj.id],
+                        layerType    = obj.type || (layerContext && layerContext.type);
+                    
+                    if (layerType === "adjustmentLayer") {
+                        console.warn("An adjustment layer changed, treating this as an unknown change: %j", obj);
+                        unknownChange = true;
+                    }
 
-                if (obj.hasOwnProperty("index")) {
-                    layersMoved = true;
-                }
-            }
-        });
-
-        if (!unknownChange && layersMoved && documentContext.layers) {
-            Object.keys(documentContext.layers).forEach(function (layerId) {
-                var layerContext = documentContext.layers[layerId];
-                if (!unknownChange && layerContext.type === "adjustmentLayer") {
-                    console.warn("A layer was moved in a document that contains adjustment layers," +
-                        " treating this as an unknown change");
-                    unknownChange = true;
+                    if (obj.hasOwnProperty("index")) {
+                        layersMoved = true;
+                    }
                 }
             });
+            
+            if (!unknownChange && layersMoved && documentContext.layers) {
+                Object.keys(documentContext.layers).forEach(function (layerId) {
+                    var layerContext = documentContext.layers[layerId];
+                    if (!unknownChange && layerContext.type === "adjustmentLayer") {
+                        console.warn("A layer was moved in a document that contains adjustment layers," +
+                            " treating this as an unknown change");
+                        unknownChange = true;
+                    }
+                });
+            }
+        } catch (e) {
+            console.error("Error when handling a change to a document: ", e);
+            documentChangeDeferred.resolve();
+            return documentChangeDeferred.promise;
         }
 
+        var moreInformationNeeded = false;
+        
         // Unknown change: reset
         if (unknownChange) {
-            console.log("Handling an unknown change by deleting all generated files and resetting the state");
+            console.log("Unknown change occured: need more information about the document");
+            moreInformationNeeded = true;
+            
+            console.log("Deleting all generated files");
             if (documentContext) {
                 Object.keys(documentContext.layers).forEach(function (layerId) {
                     deleteFilesRelatedToLayer(document.id, layerId);
                 });
             }
-            requestEntireDocument(document.id);
-            return;
         }
-
         // Possible reasons for an undefined context:
         // - User created a new image
         // - User opened an image
         // - User switched to an image that was created/opened before Generator started
-        if (!documentContext) {
-            console.log("Unknown document, so getting all information");
-            requestEntireDocument(document.id);
-            return;
+        else if (!documentContext) {
+            console.log("Document is unknown: need more information about the document");
+            moreInformationNeeded = true;
         }
-            
-        // We have seen this document before: information about the changes are enough
-        
-        // Resize event: regenerate everything
-        if (!document.layers && document.bounds) {
-            requestEntireDocument(document.id);
+        // We have seen this document before
+        // The bounds have changed, but the file isn't mentioned: Resize event, regenerate everything
+        else if (!document.file && document.bounds) {
+            console.log("Image was resized: need more information about the document");
+            moreInformationNeeded = true;
+        }
+
+        if (moreInformationNeeded) {
+            console.log("More information was requested: loading the entire document");
+            return requestEntireDocument(document.id);
         } else {
-            processChangesToDocument(document);
+            return processChangesToDocument(document);
         }
     }
 
@@ -562,7 +661,7 @@
             console.log("Determining the current document ID");
         }
         
-        _generator.getDocumentInfo(documentId).then(
+        return _generator.getDocumentInfo(documentId).then(
             function (document) {
                 console.log("Received complete document:", stringify(document));
 
@@ -583,12 +682,12 @@
                 if (_contextPerDocument[documentId]) {
                     resetDocumentContext(documentId);
                 }
-                processChangesToDocument(document);
+                return processChangesToDocument(document);
             },
             function (err) {
                 console.error("[Assets] Error in getDocumentInfo:", err);
             }
-        ).done();
+        );
     }
 
     function updateMenuState() {
@@ -625,30 +724,30 @@
         // Stop if the document isn't an object describing a menu (could be "[ActionDescriptor]")
         // Happens if no document is open, but maybe also at other times
         if (!document.id) {
-            return;
+            return resolvedPromise();
         }
         
         var context = _contextPerDocument[document.id];
         
-        if (!context) {
-            resetDocumentContext(document.id);
-            context = _contextPerDocument[document.id];
-            
-            if (document.generatorSettings) {
-                console.log("Document contains generator settings", document.generatorSettings);
-                var settings = _generator.extractDocumentSettings(document, PLUGIN_ID);
-                console.log("Parsed generator for plugin " + PLUGIN_ID + " as", settings);
-                context.assetGenerationEnabled = Boolean(settings.enabled);
-                updateMenuState();
-            }
-        }
-
-        // Now that we know this document, we can actually process any related menu clicks
-        processMenuEvents();
-
         // Create an already resolved promise so we can add steps in sequence
-        resolvedPromise()
+        return resolvedPromise()
             .then(function () {
+                if (!context) {
+                    resetDocumentContext(document.id);
+                    context = _contextPerDocument[document.id];
+                    
+                    if (document.generatorSettings) {
+                        console.log("Document contains generator settings", document.generatorSettings);
+                        var settings = _generator.extractDocumentSettings(document, PLUGIN_ID);
+                        console.log("Parsed generator for plugin " + PLUGIN_ID + " as", settings);
+                        context.assetGenerationEnabled = Boolean(settings.enabled);
+                        updateMenuState();
+                    }
+                }
+
+                // Now that we know this document, we can actually process any related menu clicks
+                processMenuEvents();
+
                 // If there is a file name (e.g., after saving or when switching between files, even unsaved ones)
                 if (document.file) {
                     return processPathChange(document);
@@ -731,18 +830,18 @@
                     }
                 }
 
-                Q.allSettled(pendingPromises).then(function () {
-                    // Delete directory foo-assets/ for foo.psd if it is empty now
-                    deleteDirectoryIfEmpty(context.assetGenerationDir);
-                });
-            })
-            .done();
+                return Q.allSettled(pendingPromises);
+            });
     }
 
     function processPathChange(document) {
         var context      = _contextPerDocument[document.id],
             wasSaved     = context.isSaved,
             previousPath = context.path;
+
+        if (document.file === previousPath) {
+            return;
+        }
 
         console.log("Document path changed from %j to %j", previousPath, document.file);
 
